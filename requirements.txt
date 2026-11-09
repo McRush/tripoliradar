@@ -1,0 +1,12 @@
+# Viewer (tools/view.py). Install pygame-ce only: plain pygame shares its folder and the two overwrite each other.
+pygame-ce>=2.4
+moderngl>=5.8
+PyGLM
+numpy
+PyOpenGL
+
+# Optional, for some data tools: world.py --png and the map labeller (Pillow), preview.py (matplotlib),
+# dis16.py (capstone)
+# Pillow
+# matplotlib
+# capstone
