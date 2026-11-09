@@ -354,8 +354,12 @@ class GraphicsEngine:
         log.gpu_end()
         log.lap('resolve')
 
-        # Swap buffers
+        # Swap buffers. The driver queues the swap and returns at once; the wait for the vsync would then land in
+        # the next frame's first draw to the window, inside a moderngl call that keeps the GIL: the live reader
+        # thread (live.LiveSource) then gets to poll only ~60 times a second and misses game frames. glFinish
+        # through PyOpenGL (ctypes, GIL released) takes that wait here instead.
         pg.display.flip()
+        GL.glFinish()
         log.lap('flip')
         log.presented()
 
