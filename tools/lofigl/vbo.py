@@ -52,6 +52,24 @@ F19_DECAL_STEP_REL = 0.0003  # ... or this fraction of the model's radius if lar
 # Per library: that width times this; 0 = plain GL lines only.
 F19_LINE_WIDTH = {"STFLT": 0.0}     # aircraft and weapons: their lines are fine detail
 F19_LINE_WIDTH_DEFAULT = 1.0        # theaters, PHOTO
+# Per-model fixes, (library, model index) -> build_f19_model keyword arguments. Not done for every model: most
+# are drawn in plane-sorted (BSP) order, where geometry under a surface may really be meant to be hidden.
+# sunk: decals sunk into the hull. The game paints them after the surface above them, so they show; with a
+#       depth buffer they're hidden. Their vertices that lie just under an earlier polygon of another colour
+#       are pulled up onto it (plus one decal step).
+# cut:  polygons drawn flush instead of lifted as decals: their outline is cut out of the earlier coplanar
+#       polygons of other colours they overlap. For a decal whose sides join other faces, where lifting it
+#       opens a slit.
+F19_MODEL_FIXES = {
+    ("STFLT", 8): dict(sunk=(31, 32, 33, 34)),          # F-14 canopy, ~0.45 under the spine
+    ("STFLT", 18): dict(sunk=(16, 17),                  # Tu-95 / 767 windshield, 0.5 under the nose
+                        cut=(14,)),                     # roof over the stabilizer roots
+    ("LB", 69): dict(sunk=(20,)),                       # ship: deck marking 0.9 under the stern slope
+    ("NC", 64): dict(sunk=(20,)),
+    ("PG", 76): dict(sunk=(18,)),
+    ("PHOTO", 5): dict(sunk=(10, 11)),                  # canopy, 1.3 under the fuselage
+}
+F19_SUNK_MAX = 1.5                      # deepest a vertex may sit under the surface to be pulled up
 
 
 class F19VBO(BaseVBO):
@@ -115,8 +133,125 @@ def _plane_axes(n):
     return ax, np.cross(n, ax)
 
 
-def build_f19_model(body):
+def _inside_2d(pt, poly, eps=1e-6):
+    """Point in convex 2-D polygon (either winding); points on the outline count."""
+    e = np.roll(poly, -1, axis=0) - poly
+    c = e[:, 0] * (pt[1] - poly[:, 1]) - e[:, 1] * (pt[0] - poly[:, 0])
+    return bool((c >= -eps).all() or (c <= eps).all())
+
+
+def _unsink(body, verts, prims, step):
+    """Positions for the vertices of the listed (sunk) polygons, pulled out of earlier polygons of another
+    colour they lie under (see F19_SUNK_DECALS). Computed per vertex, over every listed polygon using it,
+    so neighbouring decal polygons stay joined. Returns {vertex index: new position}."""
+    planes = body["planes"]
+    polys = []      # (prim index, colour, unit plane normal, vertex loop) of planed polygons
+    for i, prim in enumerate(body["prims"]):
+        if prim["kind"] != "poly" or prim["color"] == 0xFF or prim["plane"] >= len(planes):
+            continue
+        loop = _f19_edge_loop(body, prim)
+        if loop and len(loop) >= 3:
+            n = np.array(planes[prim["plane"]][:3], dtype="f8")
+            polys.append((i, prim["color"], n / np.linalg.norm(n), loop))
+    pushes = {}     # vertex -> {earlier prim index: (its normal, signed depth of the vertex)}
+    for i, color, n, loop in polys:
+        if i not in prims:
+            continue
+        for j, c2, n2, loop2 in polys:
+            if j >= i or c2 == color or n @ n2 < 0.5:
+                continue
+            q = verts[loop2]
+            ax, ay = _plane_axes(n2)
+            outline = np.stack([q @ ax, q @ ay], axis=1)
+            for k in loop:
+                d = float((verts[k] - q[0]) @ n2)
+                if -F19_SUNK_MAX < d < -1e-6 and _inside_2d((verts[k] @ ax, verts[k] @ ay), outline):
+                    pushes.setdefault(k, {})[j] = (n2, d)
+    moved = {}
+    for k, under in pushes.items():
+        u = sum(n2 for n2, _ in under.values())
+        u /= np.linalg.norm(u)
+        t = max((step - d) / (u @ n2) for n2, d in under.values())
+        moved[k] = verts[k] + u * t
+    return moved
+
+
+def _clip_half(poly, p, q, left):
+    """Part of convex 2-D polygon `poly` left (or right) of the directed line p -> q (Sutherland-Hodgman)."""
+    d = q - p
+    s = d[0] * (poly[:, 1] - p[1]) - d[1] * (poly[:, 0] - p[0])
+    if not left:
+        s = -s
+    out = []
+    for k in range(len(poly)):
+        a, b, sa, sb = poly[k], poly[(k + 1) % len(poly)], s[k], s[(k + 1) % len(poly)]
+        if sa >= 0:
+            out.append(a)
+        if (sa > 0 > sb) or (sa < 0 < sb):
+            out.append(a + (b - a) * (sa / (sa - sb)))
+    return np.array(out).reshape(-1, 2)
+
+
+def _area_2d(poly):
+    if len(poly) < 3:
+        return 0.0
+    nxt = np.roll(poly, -1, axis=0)
+    return 0.5 * float((poly[:, 0] * nxt[:, 1] - poly[:, 1] * nxt[:, 0]).sum())
+
+
+def _subtract_2d(a, b):
+    """Convex 2-D polygon a minus convex polygon b, as a list of convex pieces (a's winding kept)."""
+    if _area_2d(b) < 0:
+        b = b[::-1]
+    pieces, rest = [], a
+    for k in range(len(b)):
+        p, q = b[k], b[(k + 1) % len(b)]
+        outside = _clip_half(rest, p, q, left=False)
+        if abs(_area_2d(outside)) > 1e-6:
+            pieces.append(outside)
+        rest = _clip_half(rest, p, q, left=True)
+        if abs(_area_2d(rest)) <= 1e-6:
+            break
+    return pieces
+
+
+def _cut(body, verts, cutters):
+    """Cut the outlines of the `cutters` prims out of the earlier coplanar polygons of other colours they
+    overlap (see F19_MODEL_FIXES). Returns {prim index: [3-D vertex loops of the pieces left]}."""
+    polys = {}
+    for i, prim in enumerate(body["prims"]):
+        if prim["kind"] == "poly" and prim["color"] != 0xFF and prim["plane"] < len(body["planes"]):
+            loop = _f19_edge_loop(body, prim)
+            if loop and len(loop) >= 3:
+                polys[i] = verts[loop]
+    pieces = {}
+    for ci in sorted(cutters):
+        cprim = body["prims"][ci]
+        n = np.array(body["planes"][cprim["plane"]][:3], dtype="f8")
+        n /= np.linalg.norm(n)
+        ax, ay = _plane_axes(n)
+        to2d = lambda pts: np.stack([pts @ ax, pts @ ay], axis=1)
+        c2 = to2d(polys[ci])
+        depth = float(polys[ci][0] @ n)
+        for i, pts in polys.items():
+            prim = body["prims"][i]
+            if (i >= ci or prim["plane"] != cprim["plane"] or prim["color"] == cprim["color"]
+                    or abs(float(pts[0] @ n) - depth) > 0.05):
+                continue
+            left = []
+            for piece in pieces.get(i, [pts]):
+                p2 = to2d(piece)
+                if not _overlap_2d(p2, c2):
+                    left.append(piece)
+                    continue
+                left += [q[:, :1] * ax + q[:, 1:] * ay + depth * n for q in _subtract_2d(p2, c2)]
+            pieces[i] = left
+    return pieces
+
+
+def build_f19_model(body, sunk=(), cut=()):
     """Turn a mesh body from export/3d/<LIB>.json into (triangle data, line data) float32 arrays.
+    `sunk`, `cut`: per-model fixes, prim indices (see F19_MODEL_FIXES).
 
     The game culls each polygon by its face plane (visible when the eye is in front of it), so every
     polygon is wound counter-clockwise around its plane normal and drawn with back-face culling:
@@ -133,6 +268,8 @@ def build_f19_model(body):
     decal_step = max(F19_DECAL_STEP, F19_DECAL_STEP_REL * radius)
     tris, lines = [], []
     layers = {}   # plane index -> (normal, axes, [(2-D outline, depth, layer, colour)])
+    moved = _unsink(body, verts, set(sunk), decal_step) if sunk else {}
+    pieces = _cut(body, verts, cut) if cut else {}
 
     def uv(color):
         return ((color & 15) + 0.5) / F19_PALETTE_SIZE, 0.5
@@ -142,7 +279,7 @@ def build_f19_model(body):
         for p in _f19_to_gl(pts):
             out.append((u, v, *normal, *p))
 
-    for prim in body["prims"]:
+    for pi, prim in enumerate(body["prims"]):
         color = prim["color"]
         if color == 0xFF:      # not drawn
             continue
@@ -177,7 +314,9 @@ def build_f19_model(body):
             emit(lines, verts[loop[:2]], (0.0, 0.0, 0.0), color)
             continue
         pts = verts[loop]
-        newell = np.cross(pts, np.roll(pts, -1, axis=0)).sum(axis=0)
+        if pi in sunk:
+            pts = np.array([moved.get(k, verts[k]) for k in loop])
+        newell =np.cross(pts, np.roll(pts, -1, axis=0)).sum(axis=0)
         if np.linalg.norm(newell) < 1e-9:
             continue
         newell /= np.linalg.norm(newell)
@@ -194,25 +333,24 @@ def build_f19_model(body):
                 for k in range(1, len(loop_pts) - 1):
                     emit(tris, loop_pts[[0, k, k + 1]], normal, color)
             continue
-        if facing < 0:
-            pts = pts[::-1]
-
-        # decal layer among overlapping coplanar primitives drawn earlier
         if plane not in layers:
             layers[plane] = (n, _plane_axes(n), [])
         _, (ax, ay), same = layers[plane]
-        outline = np.stack([pts @ ax, pts @ ay], axis=1)
-        depth = float(pts[0] @ n)
-        layer = 0
-        for o, d, l, c in same:
-            if abs(d - depth) < 0.05 and _overlap_2d(o, outline):
-                layer = max(layer, l if c == color else l + 1)
-        same.append((outline, depth, layer, color))
-        pts = pts + n * (layer * decal_step)
-
         normal = _f19_to_gl(n)
-        for k in range(1, len(pts) - 1):
-            emit(tris, pts[[0, k, k + 1]], normal, color)
+        for pts in pieces.get(pi, [pts]):    # the polygon, or what is left of it after cuts
+            if facing < 0:
+                pts = pts[::-1]
+            # decal layer among overlapping coplanar primitives drawn earlier
+            outline = np.stack([pts @ ax, pts @ ay], axis=1)
+            depth = float(pts[0] @ n)
+            layer = 0
+            for o, d, l, c in same:
+                if abs(d - depth) < 0.05 and _overlap_2d(o, outline):
+                    layer = max(layer, l if c == color else l + 1)
+            same.append((outline, depth, layer, color))
+            pts = pts + n * (layer * decal_step)
+            for k in range(1, len(pts) - 1):
+                emit(tris, pts[[0, k, k + 1]], normal, color)
 
     def pack(rows):
         return np.array(rows, dtype="f4").reshape(-1, 8)
@@ -355,7 +493,7 @@ class VBOManager:
                 body = lib["bodies"][hex(model["body"])]
                 if body["type"] != "mesh":
                     continue
-                tris, lines = build_f19_model(body)
+                tris, lines = build_f19_model(body, **F19_MODEL_FIXES.get((name, model["index"]), {}))
                 key = f"f19/{name}_{model['index']:02d}"
                 if len(tris):
                     self.vbos[key] = F19VBO(self.ctx, tris)
